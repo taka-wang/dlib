@@ -30,6 +30,7 @@ SET(lapack_with_underscore 0)
 SET(lapack_without_underscore 0)
 
 message(STATUS "Searching for BLAS and LAPACK")
+INCLUDE(CheckFunctionExists)
 
 if (UNIX OR MINGW)
    message(STATUS "Searching for BLAS and LAPACK")
@@ -62,11 +63,15 @@ if (UNIX OR MINGW)
       return()
    endif()
 
+   
    # First, search for libraries via pkg-config, which is the cleanest path
    find_package(PkgConfig)
    pkg_check_modules(BLAS_REFERENCE cblas)
    pkg_check_modules(LAPACK_REFERENCE lapack)
-   if (BLAS_REFERENCE_FOUND AND LAPACK_REFERENCE_FOUND)
+   # Make sure the cblas found by pkgconfig actually has cblas symbols.
+   SET(CMAKE_REQUIRED_LIBRARIES "${BLAS_REFERENCE_LDFLAGS}")   
+   CHECK_FUNCTION_EXISTS(cblas_ddot PKGCFG_HAVE_CBLAS)
+   if (BLAS_REFERENCE_FOUND AND LAPACK_REFERENCE_FOUND AND PKGCFG_HAVE_CBLAS)
       set(blas_libraries "${BLAS_REFERENCE_LDFLAGS}")
       set(lapack_libraries "${LAPACK_REFERENCE_LDFLAGS}")
       set(blas_found 1)
@@ -75,7 +80,7 @@ if (UNIX OR MINGW)
       message(STATUS "Found BLAS and LAPACK via pkg-config")
       return()
    endif()
-
+   
    include(CheckTypeSize)
    check_type_size( "void*" SIZE_OF_VOID_PTR)
 
@@ -189,8 +194,6 @@ if (UNIX OR MINGW)
       $ENV{OPENBLAS_HOME}/lib
       )
 
-   INCLUDE (CheckFunctionExists)
-
    if (NOT blas_found)
       find_library(cblas_lib NAMES openblasp openblas PATHS ${extra_paths})
       if (cblas_lib)
@@ -280,8 +283,8 @@ if (UNIX OR MINGW)
    # with it.  But it's fine since the MKL should always have cblas.
    if (blas_found AND NOT found_intel_mkl)
       set(CMAKE_REQUIRED_LIBRARIES ${blas_libraries})
-      CHECK_FUNCTION_EXISTS(cblas_ddot HAVE_CBLAS)
-      if (NOT HAVE_CBLAS)
+      CHECK_FUNCTION_EXISTS(cblas_ddot FOUND_BLAS_HAS_CBLAS)
+      if (NOT FOUND_BLAS_HAS_CBLAS)
          message(STATUS "BLAS library does not have cblas symbols, so dlib will not use BLAS or LAPACK")
          set(blas_found 0)
          set(lapack_found 0)
@@ -337,7 +340,6 @@ elseif(WIN32 AND NOT MINGW)
       find_library(mkl_intel  mkl_intel_c ${mkl_search_path})
    endif()
 
-   INCLUDE (CheckFunctionExists)
 
    # Get mkl_include_dir
    set(mkl_include_search_path
@@ -398,8 +400,8 @@ elseif(WIN32 AND NOT MINGW)
       # the compiler we are using.  One way to do this check is to see if we can
       # link to it right now.
       set(CMAKE_REQUIRED_LIBRARIES ${blas_libraries})
-      CHECK_FUNCTION_EXISTS(cblas_ddot HAVE_CBLAS)
-      if (NOT HAVE_CBLAS)
+      CHECK_FUNCTION_EXISTS(cblas_ddot MKL_HAS_CBLAS)
+      if (NOT MKL_HAS_CBLAS)
          message("BLAS library does not have cblas symbols, so dlib will not use BLAS or LAPACK")
          set(blas_found 0)
          set(lapack_found 0)
@@ -432,7 +434,6 @@ endif()
 
 # If using lapack, determine whether to mangle functions
 if (lapack_found)
-   include(CheckFunctionExists)
    include(CheckFortranFunctionExists)
    set(CMAKE_REQUIRED_LIBRARIES ${lapack_libraries})
 

@@ -4,6 +4,7 @@
 #include "cuda_utils.h"
 #include "cuda_dlib.h"
 #include "cudnn_dlibapi.h"
+#include <math_constants.h>
 
 
 namespace dlib 
@@ -1481,6 +1482,60 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_gelu(const float* s, float* d, size_t n)
+        {
+            for (auto i : grid_stride_range(0, n))
+            {
+                d[i] = s[i] * normcdf(s[i]);
+            }
+        }
+
+        void gelu (
+            tensor& dest,
+            const tensor& src
+        )
+        {
+            launch_kernel(_cuda_gelu, max_jobs(dest.size()), src.device(), dest.device(), src.size());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        __device__ float gelu_compute_gradient(float x)
+        {
+                const float beta = 1.0f / CUDART_SQRT_2PI;
+                const float cdf = normcdf(x);
+                const float pdf = beta*std::exp(-0.5f*x*x);
+                return cdf + x * pdf;
+        }
+
+        __global__ void _cuda_gelu_gradient_inplace(float* out, const float* s, const float* gi, size_t n)
+        {
+            for (auto i : grid_stride_range(0, n))
+                out[i] = gi[i]*gelu_compute_gradient(s[i]);
+        }
+
+        __global__ void _cuda_gelu_gradient(float* out, const float* s, const float* gi, size_t n)
+        {
+            for (auto i : grid_stride_range(0, n))
+                out[i] += gi[i]*gelu_compute_gradient(s[i]);
+        }
+
+        void gelu_gradient (
+            tensor& grad,
+            const tensor& src,
+            const tensor& gradient_input
+        )
+        {
+            float* out = grad.device();
+            const float* gi = gradient_input.device();
+            if (out == gi)
+                launch_kernel(_cuda_gelu_gradient_inplace, max_jobs(grad.size()), out, src.device(), gi, grad.size());
+            else
+                launch_kernel(_cuda_gelu_gradient, max_jobs(grad.size()), out, src.device(), gi, grad.size());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __global__ void _cuda_resize_bilinear(size_t dsize, size_t dchan_size, size_t dnc, float* d, 
                                               size_t schan_size, int snr, int snc, const float* s, 
                                               const float x_scale, const float y_scale)
@@ -1759,9 +1814,9 @@ namespace dlib
             if (x <= -18)
                 return std::exp(x);
             else if (-18 < x && x <= 9)
-                return std::log1p(std::exp(x));
+                return std::log1pf(std::exp(x));
             else if (9 < x && x <= 16)
-                return x + std::exp(-x);
+                return x + expf(-x);
             else
                 return x;
         }
@@ -1833,6 +1888,30 @@ namespace dlib
             warp_reduce_atomic_add(*loss_out, loss);
         }
 
+        __global__ void _cuda_compute_loss_multiclass_log_per_pixel_weighted(float* loss_out, float* g, const uint16_t* truth, size_t n, size_t plane_size, size_t sample_size, size_t nk, const float* weights, const float scale)
+        {
+            float loss = 0;
+            for(auto i : grid_stride_range(0, n))
+            {
+                const size_t k = (i/plane_size)%nk;
+                const size_t idx = (i%plane_size) + plane_size*(i/sample_size);
+
+                const size_t y = truth[idx];
+                const float weight = weights[idx];
+
+                if (k == y)
+                {
+                    loss -= weight*cuda_safe_log(g[i]);
+                    g[i] = weight*scale*(g[i] - 1);
+                }
+                else
+                {
+                    g[i] = weight*scale*g[i];
+                }
+            }
+
+            warp_reduce_atomic_add(*loss_out, loss);
+        }
     // ----------------------------------------------------------------------------------------
 
         __global__ void _cuda_compute_loss_mean_squared_per_channel_and_pixel(float* loss_out, float* g, const float* truth, const float* out_data, size_t n, const float scale)
@@ -1891,6 +1970,30 @@ namespace dlib
 
             launch_kernel(_cuda_compute_loss_multiclass_log_per_pixel, max_jobs(gradient.size()),
                 loss_work_buffer.data(), gradient.device(), truth_buffer.data(), gradient.size(), gradient.nr()*gradient.nc(), gradient.nr()*gradient.nc()*gradient.k(), gradient.k(), label_to_ignore, scale);
+
+            float floss;
+            dlib::cuda::memcpy(&floss, loss_work_buffer);
+            loss = scale*floss;
+        }
+
+        void compute_loss_multiclass_log_per_pixel_weighted::
+        do_work(
+            cuda_data_ptr<float> loss_work_buffer,
+            cuda_data_ptr<const uint16_t> truth_buffer,
+            cuda_data_ptr<const float> weights_buffer,
+            const tensor& subnetwork_output,
+            tensor& gradient,
+            double& loss
+        )
+        {
+            CHECK_CUDA(cudaMemset(loss_work_buffer, 0, sizeof(float)));
+            softmax(gradient, subnetwork_output);
+
+            // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
+            const double scale = 1.0 / (subnetwork_output.num_samples() * subnetwork_output.nr() * subnetwork_output.nc());
+
+            launch_kernel(_cuda_compute_loss_multiclass_log_per_pixel_weighted, max_jobs(gradient.size()),
+                loss_work_buffer.data(), gradient.device(), truth_buffer.data(), gradient.size(), gradient.nr()*gradient.nc(), gradient.nr()*gradient.nc()*gradient.k(), gradient.k(), weights_buffer.data(), scale);
 
             float floss;
             dlib::cuda::memcpy(&floss, loss_work_buffer);
